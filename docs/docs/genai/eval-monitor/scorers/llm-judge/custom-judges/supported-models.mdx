@@ -39,6 +39,23 @@ MLflow supports calling model providers directly using the format `provider:/mod
 | Ollama         | `ollama:/llama3.2`                                              | None (local)                                                                                                                                                                            |
 | Databricks     | `databricks:/databricks-claude-sonnet-4-5`                      | [Databricks SDK authentication](https://docs.databricks.com/aws/en/dev-tools/auth/index.html) (e.g. `DATABRICKS_HOST` + `DATABRICKS_TOKEN`, or other supported methods)                 |
 
+### Amazon Bedrock
+
+Bedrock judges and scorers call the [Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html). Pass any Bedrock model id or inference profile id that supports messaging, for example:
+
+```python
+from mlflow.genai.scorers import Correctness, Guidelines
+
+Correctness(model="bedrock:/amazon.nova-lite-v1:0")
+Guidelines(
+    name="is_english",
+    guidelines="The answer must be in English",
+    model="bedrock:/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+)
+```
+
+The same URI works for `make_judge()`. Converse accepts `temperature`, `top_p`, `max_tokens`, and `stop` through the scorer or judge `inference_params` (or the legacy metric parameters). API-key auth uses `AWS_BEARER_TOKEN_BEDROCK` together with `AWS_REGION`.
+
 :::warning
 Judges configured with direct model providers require credentials to be available locally (typically via environment variables) and **cannot be run from the UI**. For supported chat-completion providers, use AI Gateway endpoints if you want to run judges from the UI.
 :::

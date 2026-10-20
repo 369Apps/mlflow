@@ -43,6 +43,25 @@ _BEDROCK_STREAM_EXCEPTION_STATUS = {
     "modelTimeoutException": 408,
 }
 
+# boto3 ClientError codes from bedrock-runtime Converse. Used by the synchronous
+# path that judges and scorers call; the gateway server maps these separately.
+_BEDROCK_CLIENT_ERROR_STATUS = {
+    "AccessDeniedException": 403,
+    "IncompleteSignature": 403,
+    "InvalidSignatureException": 403,
+    "NotAuthorized": 403,
+    "UnrecognizedClientException": 403,
+    "ValidationException": 400,
+    "ResourceNotFoundException": 404,
+    "ThrottlingException": 429,
+    "ServiceQuotaExceededException": 429,
+    "ModelTimeoutException": 408,
+    "ModelNotReadyException": 429,
+    "ModelErrorException": 424,
+    "InternalServerException": 500,
+    "ServiceUnavailableException": 503,
+}
+
 
 async def _event_stream_to_anthropic_sse(stream: AsyncIterable[bytes]) -> AsyncIterable[bytes]:
     """Re-emit a Bedrock InvokeModelWithResponseStream body as Anthropic server-sent events.
@@ -516,10 +535,25 @@ class AmazonBedrockProvider(BaseProvider):
                             "inputSchema": {"json": func.get("parameters", {})},
                         }
                     })
-            if bedrock_tools:
-                kwargs["toolConfig"] = {"tools": bedrock_tools}
+            if bedrock_tools and payload.get("tool_choice") != "none":
+                tool_config: dict[str, Any] = {"tools": bedrock_tools}
+                if tool_choice := self._map_tool_choice(payload.get("tool_choice")):
+                    tool_config["toolChoice"] = tool_choice
+                kwargs["toolConfig"] = tool_config
 
         return kwargs
+
+    @staticmethod
+    def _map_tool_choice(tool_choice: Any) -> dict[str, Any] | None:
+        match tool_choice:
+            case "auto":
+                return {"auto": {}}
+            case "required":
+                return {"any": {}}
+            case {"type": "function", "function": {"name": str(name)}} if name:
+                return {"tool": {"name": name}}
+            case _:
+                return None
 
     @staticmethod
     def _normalize_content_text(content: Any) -> str:
@@ -582,6 +616,135 @@ class AmazonBedrockProvider(BaseProvider):
                 total_tokens=usage.get("totalTokens"),
             ),
         )
+
+    @staticmethod
+    def _output_config_from_response_format(response_format: Any) -> dict[str, Any] | None:
+        """Map an OpenAI ``response_format`` payload to Converse ``outputConfig``.
+
+        Bedrock expects the JSON Schema as a string. Models that do not support
+        structured outputs reject ``outputConfig``; callers retry without it.
+        """
+        if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+            return None
+        spec = response_format.get("json_schema")
+        if not isinstance(spec, dict):
+            return None
+        schema = spec.get("schema")
+        if not isinstance(schema, dict):
+            return None
+
+        json_schema: dict[str, Any] = {"schema": json.dumps(schema)}
+        if name := spec.get("name"):
+            json_schema["name"] = name
+        if description := spec.get("description"):
+            json_schema["description"] = description
+        return {
+            "textFormat": {
+                "type": "json_schema",
+                "structure": {"jsonSchema": json_schema},
+            }
+        }
+
+    @staticmethod
+    def is_structured_output_error(detail: str) -> bool:
+        lower = detail.lower()
+        return (
+            "outputconfig" in lower
+            or "output_config" in lower
+            or "output config" in lower
+            or "structured output" in lower
+            or "json_schema" in lower
+            or "response_format" in lower
+        )
+
+    @staticmethod
+    def is_context_window_error(detail: str) -> bool:
+        lower = detail.lower()
+        return (
+            "context length" in lower
+            or "maximum context" in lower
+            or "too many tokens" in lower
+            or "too many input tokens" in lower
+            or ("input" in lower and "too long" in lower)
+        )
+
+    def invoke_converse(self, payload: dict[str, Any]) -> chat.ResponsePayload:
+        """Call the Bedrock Converse API synchronously.
+
+        ``payload`` is an OpenAI-style chat request. Judges and scorers use this
+        so any Converse-compatible model id works, including models that have no
+        InvokeModel adapter (Nova, Llama, Mistral, Gemma, and others).
+        """
+        request = dict(payload)
+        messages = request.pop("messages", [])
+        response_format = request.pop("response_format", None)
+        kwargs = self._build_converse_kwargs(messages, request)
+        if output_config := self._output_config_from_response_format(response_format):
+            kwargs["outputConfig"] = output_config
+
+        if self._is_token_auth:
+            response = self._converse_http(kwargs)
+        else:
+            response = self._converse_boto3(kwargs)
+        return self._converse_to_chat_response(response)
+
+    def _converse_boto3(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        import botocore.exceptions
+
+        try:
+            return self.get_bedrock_client().converse(**kwargs)
+        except botocore.exceptions.ClientError as e:
+            raise self._client_error_to_gateway_exception(e) from e
+        except botocore.exceptions.ReadTimeoutError as e:
+            raise AIGatewayException(status_code=408, detail=str(e)) from e
+        except botocore.exceptions.BotoCoreError as e:
+            raise AIGatewayException(status_code=502, detail=str(e)) from e
+
+    def _converse_http(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        import requests
+
+        from mlflow.environment_variables import MLFLOW_GENAI_EVAL_LLM_TIMEOUT
+
+        body = dict(kwargs)
+        model_id = body.pop("modelId")
+        url = f"{self._get_token_auth_base_url()}/model/{quote(str(model_id), safe=':')}/converse"
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    **self._get_token_auth_headers(),
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=body,
+                timeout=MLFLOW_GENAI_EVAL_LLM_TIMEOUT.get(),
+            )
+        except requests.exceptions.Timeout as e:
+            raise AIGatewayException(status_code=408, detail=str(e)) from e
+        except requests.exceptions.RequestException as e:
+            raise AIGatewayException(status_code=502, detail=str(e)) from e
+
+        if response.status_code >= 400:
+            detail = response.text
+            try:
+                parsed = response.json()
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                detail = parsed.get("message") or parsed.get("Message") or detail
+            raise AIGatewayException(status_code=response.status_code, detail=str(detail))
+        return response.json()
+
+    @staticmethod
+    def _client_error_to_gateway_exception(error: Exception) -> AIGatewayException:
+        response = getattr(error, "response", None) or {}
+        info = response.get("Error") or {}
+        code = info.get("Code") or "Unknown"
+        message = info.get("Message") or str(error)
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if not isinstance(status, int):
+            status = _BEDROCK_CLIENT_ERROR_STATUS.get(code, 502)
+        return AIGatewayException(status_code=status, detail=f"{code}: {message}")
 
     # ---- API methods ----
 

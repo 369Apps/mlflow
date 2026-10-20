@@ -1227,3 +1227,85 @@ async def test_bedrock_passthrough_rejects_unsupported_action():
     provider = _make_api_key_provider()
     with pytest.raises(AIGatewayException, match="Unsupported passthrough endpoint"):
         await provider.passthrough(PassthroughAction.OPENAI_CHAT, {"messages": []})
+
+
+def test_invoke_converse_maps_tools_and_response_format():
+    provider = _make_converse_provider()
+    mock_client = mock.Mock()
+    mock_client.converse.return_value = _converse_response()
+
+    with mock.patch.object(provider, "get_bedrock_client", return_value=mock_client):
+        response = provider.invoke_converse({
+            "messages": [{"role": "user", "content": "add 1 and 2"}],
+            "temperature": 0.2,
+            "max_tokens": 64,
+            "tool_choice": "auto",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "description": "Add two integers.",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "Sum",
+                    "description": "A sum.",
+                    "schema": {"type": "object", "properties": {"value": {"type": "integer"}}},
+                },
+            },
+        })
+
+    mock_client.converse.assert_called_once()
+    kwargs = mock_client.converse.call_args.kwargs
+    assert kwargs["inferenceConfig"] == {"temperature": 0.2, "maxTokens": 64}
+    assert kwargs["toolConfig"]["toolChoice"] == {"auto": {}}
+    assert kwargs["toolConfig"]["tools"][0]["toolSpec"]["name"] == "add"
+    json_schema = kwargs["outputConfig"]["textFormat"]["structure"]["jsonSchema"]
+    assert json_schema["name"] == "Sum"
+    assert json_schema["description"] == "A sum."
+    assert json.loads(json_schema["schema"])["properties"]["value"]["type"] == "integer"
+    assert response.choices[0].message.content == "Hello from Bedrock!"
+
+
+def test_invoke_converse_omits_tools_when_tool_choice_is_none():
+    provider = _make_converse_provider()
+    mock_client = mock.Mock()
+    mock_client.converse.return_value = _converse_response()
+    with mock.patch.object(provider, "get_bedrock_client", return_value=mock_client):
+        provider.invoke_converse({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "none",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "add", "description": "Add", "parameters": {}},
+                }
+            ],
+        })
+
+    assert "toolConfig" not in mock_client.converse.call_args.kwargs
+
+
+def test_invoke_converse_maps_client_error():
+    from botocore.exceptions import ClientError
+
+    provider = _make_converse_provider()
+    mock_client = mock.Mock()
+    mock_client.converse.side_effect = ClientError(
+        {
+            "Error": {"Code": "ThrottlingException", "Message": "Slow down"},
+            "ResponseMetadata": {"HTTPStatusCode": 429},
+        },
+        "Converse",
+    )
+    with mock.patch.object(provider, "get_bedrock_client", return_value=mock_client):
+        with pytest.raises(AIGatewayException, match="ThrottlingException: Slow down") as exc_info:
+            provider.invoke_converse({"messages": [{"role": "user", "content": "hi"}]})
+
+    assert exc_info.value.status_code == 429
+    mock_client.converse.assert_called_once()

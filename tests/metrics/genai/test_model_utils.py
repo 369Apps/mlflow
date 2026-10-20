@@ -11,6 +11,7 @@ from mlflow.genai.utils.gateway_utils import GatewayConfig
 from mlflow.metrics.genai import model_utils
 from mlflow.metrics.genai.model_utils import (
     _MODELS_WITHOUT_OUTPUT_CONFIG,
+    _call_llm_provider_api,
     _parse_model_uri,
     _send_request,
     call_deployments_api,
@@ -255,32 +256,28 @@ def test_score_model_anthropic(monkeypatch):
     )
 
 
+def _bedrock_converse_response(text="This is a test!"):
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"text": text}],
+            }
+        },
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 11, "outputTokens": 5, "totalTokens": 16},
+    }
+
+
 def test_score_model_bedrock(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "test-session-token")
-
-    resp = {
-        "content": [
-            {
-                "text": "This is a test!",
-                "type": "text",
-            }
-        ],
-        "id": "msg_013Zva2CMHLNnXjNJJKqJ2EF",
-        "model": "claude-3-5-sonnet-20241022",
-        "role": "assistant",
-        "stop_reason": "end_turn",
-        "stop_sequence": None,
-        "type": "message",
-        "usage": {"input_tokens": 2095, "output_tokens": 503},
-    }
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
 
     mock_bedrock = mock.MagicMock()
     with mock.patch("boto3.Session.client", return_value=mock_bedrock) as mock_session:
-        mock_bedrock.invoke_model.return_value = {
-            "body": mock.MagicMock(read=mock.MagicMock(return_value=json.dumps(resp).encode()))
-        }
+        mock_bedrock.converse.return_value = _bedrock_converse_response()
 
         response = score_model_on_payload(
             model_uri="bedrock:/anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -299,19 +296,148 @@ def test_score_model_bedrock(monkeypatch):
         aws_secret_access_key="test-secret-key",
         aws_session_token="test-session-token",
     )
-    mock_bedrock.invoke_model.assert_called_once_with(
-        # Anthropic models in Bedrock does not accept "model" and "stream" key,
-        # and requires "anthropic_version" put within the body not headers.
-        body=json.dumps({
-            "max_tokens": 1000,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": "input prompt"}],
-            "anthropic_version": "2023-06-01",
-        }).encode(),
+    # Converse takes inference parameters in inferenceConfig. Invoke-only fields
+    # such as anthropic_version are not part of the Converse request.
+    mock_bedrock.converse.assert_called_once_with(
         modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
-        accept="application/json",
-        contentType="application/json",
+        messages=[{"role": "user", "content": [{"text": "input prompt"}]}],
+        inferenceConfig={"maxTokens": 1000, "temperature": 0},
     )
+    mock_bedrock.invoke_model.assert_not_called()
+
+
+def test_score_model_bedrock_nova_uses_converse(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+
+    mock_bedrock = mock.MagicMock()
+    mock_bedrock.converse.return_value = _bedrock_converse_response("nova reply")
+    with mock.patch("boto3.Session.client", return_value=mock_bedrock) as mock_session:
+        response = _call_llm_provider_api(
+            "bedrock",
+            "amazon.nova-lite-v1:0",
+            messages=[
+                {"role": "system", "content": "You are a judge."},
+                {"role": "user", "content": "Grade this answer."},
+            ],
+            eval_parameters={"temperature": 0, "top_p": 0.9, "stop": ["END"]},
+        )
+
+    assert response == "nova reply"
+    mock_session.assert_called_once()
+    mock_bedrock.converse.assert_called_once_with(
+        modelId="amazon.nova-lite-v1:0",
+        system=[{"text": "You are a judge."}],
+        messages=[{"role": "user", "content": [{"text": "Grade this answer."}]}],
+        inferenceConfig={"temperature": 0, "topP": 0.9, "stopSequences": ["END"]},
+    )
+    mock_bedrock.invoke_model.assert_not_called()
+
+
+def test_score_model_bedrock_retries_without_structured_output(monkeypatch):
+    from botocore.exceptions import ClientError
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+
+    error = ClientError(
+        {
+            "Error": {
+                "Code": "ValidationException",
+                "Message": "This model does not support outputConfig",
+            },
+            "ResponseMetadata": {"HTTPStatusCode": 400},
+        },
+        "Converse",
+    )
+    mock_bedrock = mock.MagicMock()
+    mock_bedrock.converse.side_effect = [error, _bedrock_converse_response('{"result": "yes"}')]
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "JudgeEvaluation",
+            "schema": {"type": "object", "properties": {"result": {"type": "string"}}},
+        },
+    }
+    with mock.patch("boto3.Session.client", return_value=mock_bedrock):
+        response = _call_llm_provider_api(
+            "bedrock",
+            "amazon.nova-micro-v1:0",
+            messages=[{"role": "user", "content": "Grade this."}],
+            response_format=response_format,
+        )
+
+    assert response == '{"result": "yes"}'
+    assert mock_bedrock.converse.call_count == 2
+    first_kwargs = mock_bedrock.converse.call_args_list[0].kwargs
+    second_kwargs = mock_bedrock.converse.call_args_list[1].kwargs
+    assert first_kwargs["outputConfig"]["textFormat"]["type"] == "json_schema"
+    schema = json.loads(
+        first_kwargs["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["schema"]
+    )
+    assert schema["properties"]["result"]["type"] == "string"
+    assert first_kwargs["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["name"] == (
+        "JudgeEvaluation"
+    )
+    assert "outputConfig" not in second_kwargs
+
+
+def test_score_model_bedrock_bearer_token_uses_http(monkeypatch):
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-api-key")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+
+    http_response = mock.Mock(status_code=200)
+    http_response.json.return_value = _bedrock_converse_response("bearer reply")
+    with (
+        mock.patch("requests.post", return_value=http_response) as mock_post,
+        mock.patch("boto3.Session.client") as mock_client,
+    ):
+        response = score_model_on_payload(
+            model_uri="bedrock:/amazon.nova-micro-v1:0",
+            payload="hello",
+        )
+
+    assert response == "bearer reply"
+    mock_client.assert_not_called()
+    mock_post.assert_called_once()
+    assert mock_post.call_args.args[0] == (
+        "https://bedrock-runtime.us-west-2.amazonaws.com/model/amazon.nova-micro-v1:0/converse"
+    )
+    assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer bedrock-api-key"
+    assert mock_post.call_args.kwargs["json"]["messages"] == [
+        {"role": "user", "content": [{"text": "hello"}]}
+    ]
+
+
+def test_score_model_bedrock_access_denied(monkeypatch):
+    from botocore.exceptions import ClientError
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+
+    error = ClientError(
+        {
+            "Error": {"Code": "AccessDeniedException", "Message": "not authorized"},
+            "ResponseMetadata": {"HTTPStatusCode": 403},
+        },
+        "Converse",
+    )
+    mock_bedrock = mock.MagicMock()
+    mock_bedrock.converse.side_effect = error
+    with mock.patch("boto3.Session.client", return_value=mock_bedrock):
+        with pytest.raises(MlflowException, match="AccessDeniedException: not authorized"):
+            score_model_on_payload(
+                model_uri="bedrock:/meta.llama3-8b-instruct-v1:0",
+                payload="hello",
+            )
+
+    mock_bedrock.converse.assert_called_once()
 
 
 def test_score_model_mistral(monkeypatch):
