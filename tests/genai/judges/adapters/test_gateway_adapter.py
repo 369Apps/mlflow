@@ -1349,3 +1349,258 @@ def test_invoke_and_handle_tools_forwards_workspace_header():
         )
 
     assert captured_headers["X-MLFLOW-WORKSPACE"] == "my-workspace"
+
+
+# --- Bedrock Converse judge tests ---
+
+
+def _bedrock_converse_api_response(
+    text=None,
+    tool_use=None,
+    input_tokens=10,
+    output_tokens=5,
+):
+    content = []
+    if text is not None:
+        content.append({"text": text})
+    if tool_use is not None:
+        content.append({"toolUse": tool_use})
+    return {
+        "output": {"message": {"role": "assistant", "content": content}},
+        "stopReason": "tool_use" if tool_use else "end_turn",
+        "usage": {
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "totalTokens": input_tokens + output_tokens,
+        },
+    }
+
+
+def _patch_bedrock_client(monkeypatch, mock_client):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+    monkeypatch.delenv("AWS_ROLE_ARN", raising=False)
+    return mock.patch("boto3.Session.client", return_value=mock_client)
+
+
+def test_bedrock_judge_calls_converse(monkeypatch):
+    mock_client = mock.Mock()
+    mock_client.converse.return_value = _bedrock_converse_api_response(
+        text=json.dumps({"result": "yes", "rationale": "Looks good"})
+    )
+
+    with (
+        _patch_bedrock_client(monkeypatch, mock_client),
+        mock.patch("mlflow.genai.judges.adapters.gateway_adapter.send_chat_request") as mock_http,
+    ):
+        output = GatewayAdapter()._invoke_and_handle_tools(
+            provider="bedrock",
+            model_name="amazon.nova-micro-v1:0",
+            messages=[
+                ChatMessage(role="system", content="You are a judge."),
+                ChatMessage(role="user", content="Grade this."),
+            ],
+            trace=None,
+            num_retries=0,
+            inference_params={"temperature": 0, "max_tokens": 256},
+        )
+
+    mock_http.assert_not_called()
+    mock_client.converse.assert_called_once()
+    kwargs = mock_client.converse.call_args.kwargs
+    assert kwargs["modelId"] == "amazon.nova-micro-v1:0"
+    assert kwargs["system"] == [{"text": "You are a judge."}]
+    assert kwargs["messages"] == [{"role": "user", "content": [{"text": "Grade this."}]}]
+    assert kwargs["inferenceConfig"] == {"temperature": 0, "maxTokens": 256}
+    assert kwargs["outputConfig"]["textFormat"]["structure"]["jsonSchema"]["name"] == (
+        "JudgeEvaluation"
+    )
+    assert json.loads(output.response) == {"result": "yes", "rationale": "Looks good"}
+    assert output.num_prompt_tokens == 10
+    assert output.num_completion_tokens == 5
+
+
+def test_bedrock_judge_alias_uses_converse(monkeypatch):
+    mock_client = mock.Mock()
+    mock_client.converse.return_value = _bedrock_converse_api_response(
+        text=json.dumps({"result": "yes", "rationale": "ok"})
+    )
+    with _patch_bedrock_client(monkeypatch, mock_client):
+        GatewayAdapter()._invoke_and_handle_tools(
+            provider="amazon-bedrock",
+            model_name="meta.llama3-8b-instruct-v1:0",
+            messages=[ChatMessage(role="user", content="Grade this.")],
+            trace=None,
+            num_retries=0,
+        )
+
+    mock_client.converse.assert_called_once()
+    assert mock_client.converse.call_args.kwargs["modelId"] == "meta.llama3-8b-instruct-v1:0"
+
+
+def test_bedrock_judge_tool_loop(monkeypatch, mock_trace):
+    mock_client = mock.Mock()
+    mock_client.converse.side_effect = [
+        _bedrock_converse_api_response(
+            tool_use={"toolUseId": "tool-1", "name": "get_trace_info", "input": {}},
+            input_tokens=20,
+            output_tokens=8,
+        ),
+        _bedrock_converse_api_response(
+            text=json.dumps({"result": "yes", "rationale": "Trace looks good"}),
+            input_tokens=40,
+            output_tokens=12,
+        ),
+    ]
+
+    with (
+        _patch_bedrock_client(monkeypatch, mock_client),
+        mock.patch(
+            "mlflow.genai.judges.adapters.gateway_adapter._process_tool_calls",
+            return_value=[
+                ChatMessage(
+                    role="tool",
+                    content='{"trace_id": "test-trace"}',
+                    tool_call_id="tool-1",
+                    name="get_trace_info",
+                )
+            ],
+        ) as mock_process,
+    ):
+        output = GatewayAdapter()._invoke_and_handle_tools(
+            provider="bedrock",
+            model_name="amazon.nova-lite-v1:0",
+            messages=[ChatMessage(role="user", content="evaluate this")],
+            trace=mock_trace,
+            num_retries=0,
+        )
+
+    assert mock_client.converse.call_count == 2
+    mock_process.assert_called_once()
+    second = mock_client.converse.call_args_list[1].kwargs
+    tool_results = [
+        block["toolResult"] for block in second["messages"][-1]["content"] if "toolResult" in block
+    ]
+    assert tool_results == [
+        {
+            "toolUseId": "tool-1",
+            "content": [{"text": '{"trace_id": "test-trace"}'}],
+        }
+    ]
+    assert second["toolConfig"]["toolChoice"] == {"auto": {}}
+    assert second["toolConfig"]["tools"][0]["toolSpec"]["name"]
+    assert json.loads(output.response)["result"] == "yes"
+    assert output.num_prompt_tokens == 60
+    assert output.num_completion_tokens == 20
+
+
+def test_bedrock_judge_falls_back_when_structured_output_rejected(monkeypatch):
+    from botocore.exceptions import ClientError
+
+    mock_client = mock.Mock()
+    mock_client.converse.side_effect = [
+        ClientError(
+            {
+                "Error": {
+                    "Code": "ValidationException",
+                    "Message": "outputConfig is not supported for this model",
+                },
+                "ResponseMetadata": {"HTTPStatusCode": 400},
+            },
+            "Converse",
+        ),
+        _bedrock_converse_api_response(text=json.dumps({"result": "no", "rationale": "plain"})),
+    ]
+
+    with _patch_bedrock_client(monkeypatch, mock_client):
+        output = GatewayAdapter()._invoke_and_handle_tools(
+            provider="bedrock",
+            model_name="mistral.mistral-7b-instruct-v0:2",
+            messages=[ChatMessage(role="user", content="Grade this.")],
+            trace=None,
+            num_retries=0,
+        )
+
+    assert mock_client.converse.call_count == 2
+    assert "outputConfig" in mock_client.converse.call_args_list[0].kwargs
+    assert "outputConfig" not in mock_client.converse.call_args_list[1].kwargs
+    assert json.loads(output.response)["result"] == "no"
+
+
+def test_bedrock_judge_prunes_on_context_window_error(monkeypatch, mock_trace):
+    from botocore.exceptions import ClientError
+
+    mock_client = mock.Mock()
+    context_error = ClientError(
+        {
+            "Error": {
+                "Code": "ValidationException",
+                "Message": "Input is too long for requested model.",
+            },
+            "ResponseMetadata": {"HTTPStatusCode": 400},
+        },
+        "Converse",
+    )
+    mock_client.converse.side_effect = [
+        _bedrock_converse_api_response(
+            tool_use={"toolUseId": "tool-1", "name": "get_trace_info", "input": {}}
+        ),
+        context_error,
+        _bedrock_converse_api_response(text=json.dumps({"result": "yes", "rationale": "ok"})),
+    ]
+
+    with (
+        _patch_bedrock_client(monkeypatch, mock_client),
+        mock.patch(
+            "mlflow.genai.judges.adapters.gateway_adapter._process_tool_calls",
+            return_value=[
+                ChatMessage(role="tool", content="{}", tool_call_id="tool-1", name="get_trace_info")
+            ],
+        ),
+    ):
+        output = GatewayAdapter()._invoke_and_handle_tools(
+            provider="bedrock",
+            model_name="amazon.nova-lite-v1:0",
+            messages=[ChatMessage(role="user", content="evaluate this")],
+            trace=mock_trace,
+            num_retries=0,
+        )
+
+    assert mock_client.converse.call_count == 3
+    assert json.loads(output.response)["result"] == "yes"
+
+
+def test_bedrock_judge_retries_throttling(monkeypatch):
+    from botocore.exceptions import ClientError
+
+    mock_client = mock.Mock()
+    mock_client.converse.side_effect = [
+        ClientError(
+            {
+                "Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"},
+                "ResponseMetadata": {"HTTPStatusCode": 429},
+            },
+            "Converse",
+        ),
+        _bedrock_converse_api_response(text=json.dumps({"result": "yes", "rationale": "ok"})),
+    ]
+
+    with (
+        _patch_bedrock_client(monkeypatch, mock_client),
+        mock.patch(
+            "mlflow.genai.judges.adapters.gateway_adapter._sleep_with_backoff"
+        ) as mock_sleep,
+    ):
+        output = GatewayAdapter()._invoke_and_handle_tools(
+            provider="bedrock",
+            model_name="amazon.nova-lite-v1:0",
+            messages=[ChatMessage(role="user", content="Grade this.")],
+            trace=None,
+            num_retries=2,
+        )
+
+    assert mock_client.converse.call_count == 2
+    mock_sleep.assert_called_once_with(0)
+    assert json.loads(output.response)["result"] == "yes"

@@ -35,6 +35,7 @@ from mlflow.genai.judges.adapters.base_adapter import (
 )
 from mlflow.genai.judges.adapters.utils import (
     ChatCompletionError,
+    _sleep_with_backoff,
     is_response_format_error,
     send_chat_request,
 )
@@ -59,6 +60,7 @@ from mlflow.metrics.genai.model_utils import (
 )
 from mlflow.protos.databricks_pb2 import BAD_REQUEST, INTERNAL_ERROR, INVALID_PARAMETER_VALUE
 from mlflow.tracing.constant import AssessmentMetadataKey
+from mlflow.utils.provider_filter import normalize_provider_name
 from mlflow.utils.workspace_context import get_request_workspace
 from mlflow.utils.workspace_utils import WORKSPACE_HEADER_NAME
 
@@ -67,6 +69,9 @@ _logger = logging.getLogger(__name__)
 
 # Global cache to track model capabilities across function calls
 _MODEL_RESPONSE_FORMAT_CAPABILITIES: dict[str, bool] = {}
+
+# Transient Bedrock Converse failures. Validation errors (400) are handled by the caller.
+_BEDROCK_RETRY_STATUS_CODES = frozenset({408, 429, 500, 503})
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +209,16 @@ def _parse_response_message(
         Tuple of (ChatMessage, usage_dict) where usage_dict has
         "prompt_tokens" and "completion_tokens" keys.
     """
+    chat_response = provider.adapter_class.model_to_chat(response_data, provider.config)
+    return _message_from_chat_response(chat_response)
+
+
+def _message_from_chat_response(chat_response: Any) -> tuple["ChatMessage", dict[str, Any]]:
+    """Extract the assistant message and token usage from a normalized chat response."""
     # Lazy import: mlflow.types.llm → mlflow.types.schema → numpy, which breaks
     # the skinny client. Must stay inside the function.
     from mlflow.types.llm import ChatMessage
 
-    chat_response = provider.adapter_class.model_to_chat(response_data, provider.config)
     if not chat_response.choices:
         raise MlflowException("Empty choices in chat completions response")
 
@@ -528,6 +538,21 @@ class GatewayAdapter(BaseJudgeAdapter):
         extra_headers: dict[str, str] | None = None,
     ) -> InvokeOutput:
         """Run the tool-calling loop using the provider infrastructure for HTTP calls."""
+        from mlflow.gateway.config import Provider
+
+        if normalize_provider_name(provider) == Provider.BEDROCK:
+            return self._invoke_bedrock_converse(
+                provider=provider,
+                model_name=model_name,
+                messages=messages,
+                trace=trace,
+                num_retries=num_retries,
+                response_format=response_format,
+                inference_params=inference_params,
+                base_url=base_url,
+                extra_headers=extra_headers,
+            )
+
         # Lazy import: mlflow.types.llm pulls in numpy via mlflow.types.schema
         from mlflow.types.llm import ChatMessage
 
@@ -669,3 +694,159 @@ class GatewayAdapter(BaseJudgeAdapter):
                     f"Failed to invoke the judge model: {e}",
                     error_code=INTERNAL_ERROR,
                 ) from e
+
+    def _invoke_bedrock_converse(
+        self,
+        provider: str,
+        model_name: str,
+        messages: list["ChatMessage"],
+        trace: "Trace | None",
+        num_retries: int,
+        response_format: type[pydantic.BaseModel] | None = None,
+        inference_params: dict[str, Any] | None = None,
+        base_url: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> InvokeOutput:
+        """Run the judge tool loop against the Bedrock Converse API."""
+        from mlflow.gateway.exceptions import AIGatewayException
+        from mlflow.gateway.providers.bedrock import AmazonBedrockProvider
+        from mlflow.types.llm import ChatMessage
+
+        if base_url or extra_headers:
+            _logger.warning(
+                "Proxy URL and extra headers are not supported for Bedrock LLMs. "
+                "Ignoring the provided proxy URL and extra headers.",
+            )
+
+        provider_instance = _get_provider_instance(provider, model_name)
+        judge_messages = [ChatMessage(role=msg.role, content=msg.content) for msg in messages]
+
+        tools = []
+        if trace is not None:
+            judge_tools = list_judge_tools()
+            tools = [tool.get_definition().to_dict() for tool in judge_tools]
+
+        # `amazon-bedrock` is an alias. The model catalog is published under `bedrock`.
+        catalog_provider = normalize_provider_name(provider)
+        capability_key = f"{catalog_provider}/{model_name}"
+        include_response_format = _MODEL_RESPONSE_FORMAT_CAPABILITIES.get(capability_key, True)
+        max_context_tokens = _get_max_context_tokens(catalog_provider, model_name)
+        max_iterations = MLFLOW_JUDGE_MAX_ITERATIONS.get()
+        iteration_count = 0
+        total_prompt_tokens: int | None = None
+        total_completion_tokens: int | None = None
+
+        while True:
+            iteration_count += 1
+            if iteration_count > max_iterations:
+                _raise_iteration_limit_exceeded(max_iterations)
+
+            try:
+                payload = _build_request(
+                    messages=judge_messages,
+                    tools=tools or None,
+                    response_format=response_format,
+                    include_response_format=include_response_format,
+                    inference_params=inference_params,
+                )
+                try:
+                    chat_response = _invoke_bedrock_converse_with_retries(
+                        provider_instance, payload, num_retries
+                    )
+                except AIGatewayException as e:
+                    if AmazonBedrockProvider.is_context_window_error(e.detail):
+                        pruned = _remove_oldest_tool_call_pair(judge_messages)
+                        if pruned is None:
+                            raise MlflowException(
+                                "Context window exceeded and there are no tool calls to "
+                                "truncate. The initial prompt may be too long for the "
+                                "model's context window."
+                            ) from e
+                        judge_messages = pruned
+                        continue
+
+                    if (
+                        e.status_code == 400
+                        and include_response_format
+                        and (
+                            is_response_format_error(e.detail)
+                            or AmazonBedrockProvider.is_structured_output_error(e.detail)
+                        )
+                    ):
+                        _logger.debug(
+                            f"Model {provider}/{model_name} may not support structured "
+                            f"outputs. Error: {e.detail}. Falling back to unstructured "
+                            f"response.",
+                        )
+                        _MODEL_RESPONSE_FORMAT_CAPABILITIES[capability_key] = False
+                        include_response_format = False
+                        continue
+
+                    if e.status_code == 400:
+                        error_code = BAD_REQUEST
+                    elif e.status_code in (401, 403):
+                        error_code = INVALID_PARAMETER_VALUE
+                    else:
+                        error_code = INTERNAL_ERROR
+                    raise MlflowException(
+                        f"Failed to invoke judge model: {e.detail}",
+                        error_code=error_code,
+                    ) from e
+
+                message, usage = _message_from_chat_response(chat_response)
+                if (prompt_tokens := usage.get("prompt_tokens")) is not None:
+                    total_prompt_tokens = (total_prompt_tokens or 0) + prompt_tokens
+                if (completion_tokens := usage.get("completion_tokens")) is not None:
+                    total_completion_tokens = (total_completion_tokens or 0) + completion_tokens
+
+                if not message.tool_calls:
+                    return InvokeOutput(
+                        response=message.content,
+                        request_id=getattr(chat_response, "id", None),
+                        num_prompt_tokens=total_prompt_tokens,
+                        num_completion_tokens=total_completion_tokens,
+                    )
+
+                judge_messages.append(message)
+                tool_response_messages = _process_tool_calls(
+                    tool_calls=message.tool_calls, trace=trace
+                )
+                judge_messages.extend(tool_response_messages)
+
+                if _should_proactively_prune(usage, max_context_tokens):
+                    pruned = _remove_oldest_tool_call_pair(judge_messages)
+                    if pruned is not None:
+                        _logger.debug(
+                            f"Proactively pruned conversation history "
+                            f"(prompt_tokens={usage.get('prompt_tokens')}, "
+                            f"max={max_context_tokens})"
+                        )
+                        judge_messages = pruned
+
+            except MlflowException:
+                raise
+            except Exception as e:
+                raise MlflowException(
+                    f"Failed to invoke the judge model: {e}",
+                    error_code=INTERNAL_ERROR,
+                ) from e
+
+
+def _invoke_bedrock_converse_with_retries(
+    provider: "BaseProvider",
+    payload: dict[str, Any],
+    num_retries: int,
+):
+    """Call ``invoke_converse``, retrying throttling and transient server errors."""
+    from mlflow.gateway.exceptions import AIGatewayException
+
+    last_error: AIGatewayException | None = None
+    for attempt in range(1 + num_retries):
+        try:
+            return provider.invoke_converse(payload)
+        except AIGatewayException as e:
+            if e.status_code not in _BEDROCK_RETRY_STATUS_CODES or attempt >= num_retries:
+                raise
+            last_error = e
+            _sleep_with_backoff(attempt)
+    raise last_error

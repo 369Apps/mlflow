@@ -185,6 +185,48 @@ def _is_unsupported_output_format_error(exc: MlflowException) -> bool:
     return False
 
 
+def _bedrock_converse_exception(error: Any) -> MlflowException:
+    from mlflow.gateway.exceptions import AIGatewayException
+    from mlflow.protos.databricks_pb2 import BAD_REQUEST, INTERNAL_ERROR, INVALID_PARAMETER_VALUE
+
+    if not isinstance(error, AIGatewayException):
+        return MlflowException(f"Failed to call Amazon Bedrock Converse: {error}")
+    if error.status_code == 400:
+        error_code = BAD_REQUEST
+    elif error.status_code in (401, 403):
+        error_code = INVALID_PARAMETER_VALUE
+    else:
+        error_code = INTERNAL_ERROR
+    return MlflowException(
+        f"Failed to call Amazon Bedrock Converse: {error.detail}",
+        error_code=error_code,
+    )
+
+
+def _call_bedrock_converse(provider: "BaseProvider", payload: dict[str, Any]):
+    """Invoke Bedrock Converse, retrying once when structured output is rejected."""
+    from mlflow.gateway.exceptions import AIGatewayException
+    from mlflow.gateway.providers.bedrock import AmazonBedrockProvider
+
+    try:
+        return provider.invoke_converse(payload)
+    except AIGatewayException as first_error:
+        if payload.get("response_format") and AmazonBedrockProvider.is_structured_output_error(
+            first_error.detail
+        ):
+            _logger.debug(
+                "Bedrock model rejected structured output (%s). Retrying without outputConfig.",
+                first_error.detail,
+            )
+            try:
+                return provider.invoke_converse({
+                    k: v for k, v in payload.items() if k != "response_format"
+                })
+            except AIGatewayException as retry_error:
+                raise _bedrock_converse_exception(retry_error) from retry_error
+        raise _bedrock_converse_exception(first_error) from first_error
+
+
 def _call_llm_provider_api(
     provider_name: str,
     model: str,
@@ -252,20 +294,25 @@ def _call_llm_provider_api(
             if (v is not None) and (k in filtered_keys)
         }
 
-    chat_payload = provider.adapter_class.chat_to_model(payload, provider.config)
-    if messages is None:
-        # eval_parameters were filtered out by the RequestPayload serialization;
-        # re-apply them. When messages is not None, they're already in the payload.
-        chat_payload.update(eval_parameters)
-
     if normalize_provider_name(provider_name) == Provider.BEDROCK:
+        if messages is None:
+            # eval_parameters were filtered out by the RequestPayload serialization;
+            # re-apply them. When messages is not None, they're already in the payload.
+            payload.update(eval_parameters)
         if proxy_url or extra_headers:
             _logger.warning(
                 "Proxy URL and extra headers are not supported for Bedrock LLMs. "
                 "Ignoring the provided proxy URL and extra headers.",
             )
-        response = provider._request(chat_payload)
+        # Converse accepts any messaging model id (Claude, Nova, Llama, Mistral, Gemma).
+        chat_response = _call_bedrock_converse(provider, payload)
     else:
+        chat_payload = provider.adapter_class.chat_to_model(payload, provider.config)
+        if messages is None:
+            # eval_parameters were filtered out by the RequestPayload serialization;
+            # re-apply them. When messages is not None, they're already in the payload.
+            chat_payload.update(eval_parameters)
+
         if (provider_name, model) in _MODELS_WITHOUT_OUTPUT_CONFIG:
             chat_payload.pop("output_config", None)
             chat_payload.pop("response_format", None)
@@ -288,7 +335,7 @@ def _call_llm_provider_api(
                 headers=provider.headers | extra_headers,
                 payload=chat_payload,
             )
-    chat_response = provider.adapter_class.model_to_chat(response, provider.config)
+        chat_response = provider.adapter_class.model_to_chat(response, provider.config)
     if len(chat_response.choices) == 0:
         raise MlflowException(
             "Failed to score the provided input as the judge LLM did not return "
